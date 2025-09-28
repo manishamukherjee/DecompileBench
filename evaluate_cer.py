@@ -389,29 +389,26 @@ def main():
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    projects = list(set([
-        dataset[i]['project']
-        for i in range(len(dataset))
-    ]))
+    dataset_df = dataset.to_pandas()
+    assert isinstance(dataset_df, pd.DataFrame)
 
     decompilers = None
     opts = None
     if not os.path.exists('tmp_results'):
         os.makedirs('tmp_results')
     all_project_results = {}
-    for project in projects:
+    for project, project_df in sorted(dataset_df.groupby('project'), key=lambda x: x[0]):
         result_path = f'tmp_results/{project}_raw_results.json'
         if os.path.exists(result_path):
             with open(result_path, 'r') as f:
                 all_project_results[project] = json.load(f)
+            logger.info(f"Loaded existing results for {project}")
             continue
         try:
             print(config_path, project)
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f)
             evaluator = ReexecutableRateEvaluator(config, project)
-            project_functions = set(dataset.filter(lambda x: x['project'] == project)['file'])
-            evaluator._functions = {fuzzer: {function: path for function, path in evaluator.functions[fuzzer].items() if function in project_functions} for fuzzer in evaluator.functions}
             if not decompilers:
                 decompilers = evaluator.decompilers
             if not opts:
