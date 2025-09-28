@@ -169,7 +169,7 @@ void initializer() {{
     if (address == MAP_FAILED) {{
         syscall(EXIT, 1);
     }}
-    
+
     *(void **)(0xbabe0000) = {function};
 }}
 
