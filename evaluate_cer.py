@@ -192,11 +192,13 @@ class ReexecutableRateEvaluator(OSSFuzzDatasetGenerator):
 
         base_txt_path = pathlib.Path(self.oss_fuzz_path) / 'build' / \
             'challenges' / self.project / function_name / fuzzer / 'base.txt'
-        max_trails = 3
+        max_trails = 5
         txt_length = 0
         log_set = []
 
-        for _ in range(max_trails):
+        diff_length = 0
+        prev_diff_length = 0
+        for idx in range(max_trails):
             try:
                 result = self.exec_in_container(cmd=cmd, envs=[
                     f'LD_LIBRARY_PATH=/challenges/{function_name}:/work/lib/',
@@ -205,10 +207,10 @@ class ReexecutableRateEvaluator(OSSFuzzDatasetGenerator):
                     f'OUTPUT_TXT=/challenges/{function_name}/{fuzzer}/base.txt',
                     f'MAPPING_TXT=/challenges/{function_name}/address_mapping.txt',
                     f'LD_PRELOAD=/oss-fuzz/ld.so'
-                ], timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                ], timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 # result.check_returncode()
                 with open(str(base_txt_path), 'r') as f:
-                    base_result = f.read()
+                    base_result = f.read().split('\n')
                 if txt_length != 0 and len(base_result) != txt_length:
                     logger.error(
                         f"base txt length mismatch, expected {txt_length}, got {len(base_result)}")
@@ -218,11 +220,20 @@ class ReexecutableRateEvaluator(OSSFuzzDatasetGenerator):
                     log_set = [set() for _ in range(txt_length)]
                 for i, line in enumerate(base_result):
                     log_set[i].add(line)
+                diff_length = len([log for log in log_set if len(log) > 1])
+                if diff_length == prev_diff_length and idx >0:
+                    logger.info(f"diff length: {diff_length}")
+                    break
+                if idx < max_trails - 1:
+                    prev_diff_length = diff_length
 
             except Exception as e:
                 logger.error(
                     f"base txt generation failed:{e}")
                 return (fuzzer, function_name, {})
+        if not diff_length == prev_diff_length:
+            logger.info(f"diff length cant converge : {fuzzer} {function_name}")
+            return (fuzzer, function_name, {})
 
         diff_result = {}
         target_libs = {}
@@ -239,17 +250,17 @@ class ReexecutableRateEvaluator(OSSFuzzDatasetGenerator):
             target_txt_path = pathlib.Path(self.oss_fuzz_path) / 'build' / 'challenges' / \
                 self.project / function_name / fuzzer / f'{options}.txt'
             try:
-                result = self.exec_in_container(cmd=cmd, envs=[
+                self.exec_in_container(cmd=cmd, envs=[
                     f'LD_LIBRARY_PATH={target_lib_path}:/work/lib/',
                     f'LLVM_PROFILE_FILE=/challenges/{function_name}/{fuzzer}/{options}.profraw',
                     f'OUTPUT_PROFDATA=/challenges/{function_name}/{fuzzer}/{options}.profdata',
                     f'OUTPUT_TXT=/challenges/{function_name}/{fuzzer}/{options}.txt',
                     f'MAPPING_TXT=/challenges/{function_name}/address_mapping.txt',
                     f'LD_PRELOAD=/oss-fuzz/ld.so',
-                ], timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                ], timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 # result.check_returncode()
                 with open(str(target_txt_path), 'r') as f:
-                    target_result = f.read()
+                    target_result = f.read().split('\n')
                 target_difference = []
                 for i, line in enumerate(target_result):
                     if len(log_set[i]) == 1 and line not in log_set[i]:
@@ -264,7 +275,7 @@ class ReexecutableRateEvaluator(OSSFuzzDatasetGenerator):
                     diff_result[options] = False
             except Exception as e:
                 logger.error(
-                    f"--- target txt diff {self.project} {function_name} {fuzzer} {options}: target txt generation failed")
+                    f"--- target txt diff {self.project} {function_name} {fuzzer} {options}: target txt generation failed", e)
                 diff_result[options] = False
 
         self.exec_in_container(
@@ -308,29 +319,50 @@ def show_statistics(all_project_results, dataset: datasets.Dataset, decompilers,
 
     df = dataset.to_pandas()
     assert isinstance(df, pd.DataFrame)
-    function_count = len(df.groupby(['project', 'idx']))
+    function_count = 0
 
     # Count passes and totals
+    wrong_results = []
     for project, results in all_project_results.items():
         pass_count[project] = {}
         for decompiler in decompilers:
             pass_count[project].setdefault(decompiler, {})
             for option in opts:
                 pass_count[project][decompiler].setdefault(option, 0)
-        for function, decompiler_results in results.items():
-            for decompiler, option_results in decompiler_results.items():
-                for option, results in option_results.items():
-                    all_passed = all(result[1] for result in results)
-                    if all_passed:
-                        pass_count[project][decompiler][option] += 1
-
-    # Print statistics
+        function_count += len(results)
+        try:
+            for _, decompiler_results in results.items():
+                for decompiler, option_results in decompiler_results.items():
+                    for option, results in option_results.items():
+                        all_passed = all(result[1] for result in results)
+                        if all_passed:
+                            pass_count[project][decompiler][option] += 1
+        except Exception:
+            wrong_results.append(project)
+            continue
+    # Create a new data structure to store success rates for each project
+    project_success_rates = {}
+    total_success_rates = {decompiler: {option: 0 for option in opts} for decompiler in decompilers}
+    
+    # Calculate and store success rates
+    for project in pass_count:
+        try:
+            project_success_rates[project] = {}
+            for decompiler in decompilers:
+                project_success_rates[project][decompiler] = {}
+                for option in opts:
+                    passes = pass_count[project][decompiler][option]
+                    total_success_rates[decompiler][option] += passes
+                    rate = passes / len(all_project_results[project])
+                    project_success_rates[project][decompiler][option] = rate
+        except Exception:
+            continue
+    
     for decompiler in decompilers:
         for option in opts:
-            passes = sum([pass_count[project][decompiler][option]
-                         for project in pass_count])
-            rate = passes / function_count
-            print(f"decompiler:{decompiler}, option:{option}, rate:{rate:.2f}")
+            total_success_rates[decompiler][option] = total_success_rates[decompiler][option] / function_count
+            print(f"decompiler:{decompiler}, option:{option}, rate:{total_success_rates[decompiler][option]:.2f}")
+    return pass_count, wrong_results, project_success_rates
 
 
 def main():
@@ -365,11 +397,18 @@ def main():
         os.makedirs('tmp_results')
     all_project_results = {}
     for project in projects:
+        result_path = f'tmp_results/{project}_raw_results.json'
+        if os.path.exists(result_path):
+            with open(result_path, 'r') as f:
+                all_project_results[project] = json.load(f)
+            continue
         try:
             print(config_path, project)
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f)
             evaluator = ReexecutableRateEvaluator(config, project)
+            project_functions = set(dataset.filter(lambda x: x['project'] == project)['file'])
+            evaluator._functions = {fuzzer: {function: path for function, path in evaluator.functions[fuzzer].items() if function in project_functions} for fuzzer in evaluator.functions}
             if not decompilers:
                 decompilers = evaluator.decompilers
             if not opts:
@@ -379,10 +418,9 @@ def main():
                 # Process the results into a structured format
                 processed_results = process_results(results)
                 all_project_results[project] = processed_results
-
                 # Also save the raw results for reference
-                with open(f'tmp_results/{project}_raw_results.json', 'w') as f:
-                    json.dump(results, f, default=str)
+                with open(result_path, 'w') as f:
+                    json.dump(processed_results, f, default=str)
         except KeyboardInterrupt:
             break
         except Exception as e:
