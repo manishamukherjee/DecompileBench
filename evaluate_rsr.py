@@ -263,6 +263,9 @@ def evaluate_func(args):
                 ret.check_returncode()
                 flag_compile = 1
             except Exception:
+                print("===== COMPILE ERROR =====")
+                print(stderr)
+                print("=========================")
                 return flag_compile, warnings
 
             return flag_compile, warnings
